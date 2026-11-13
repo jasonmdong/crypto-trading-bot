@@ -25,8 +25,12 @@ INSTRUMENT_NAME = "USDU_USD"
 BASE_CURRENCY = "USDU"
 QUOTE_CURRENCY = "USD"
 
-# Purchase amount = round(RANDOM_AMOUNT_MULTIPLIER * random(), 2)
-RANDOM_AMOUNT_MULTIPLIER = 20
+# Purchase amount = round(max_amount * random(), 2), where max_amount depends on
+# the current best ask: the full MAX_AMOUNT_USD at or below FULL_BUY_PRICE,
+# shrinking linearly to $0 at NO_BUY_PRICE. At or above NO_BUY_PRICE nothing is bought.
+MAX_AMOUNT_USD = Decimal("20")
+FULL_BUY_PRICE = Decimal("0.995")
+NO_BUY_PRICE = Decimal("1.000")
 
 _TRUE = {"1", "true", "yes", "on"}
 _FALSE = {"0", "false", "no", "off"}

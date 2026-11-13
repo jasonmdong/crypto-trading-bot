@@ -1,14 +1,16 @@
-"""Buy a random USD amount (0-20) of USDU on the Crypto.com Exchange.
+"""Buy a random, price-scaled USD amount of USDU on the Crypto.com Exchange.
+
+The cheaper USDU is below $1, the larger the random buy (up to $20); at $1 or
+above nothing is bought. See MAX_AMOUNT_USD / FULL_BUY_PRICE / NO_BUY_PRICE.
 
 Usage:  python main.py
 
-DRY_RUN is on by default. Live orders need DRY_RUN=false *and* typing BUY at
-the confirmation prompt. See README.md.
+DRY_RUN is on by default. With DRY_RUN=false it trades without asking.
+See README.md.
 """
 
 from __future__ import annotations
 
-import json
 import secrets
 import sys
 import time
@@ -16,15 +18,17 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from random import Random
 from typing import Any
 
 from config import (
     BASE_CURRENCY,
+    FULL_BUY_PRICE,
     INSTRUMENT_NAME,
+    MAX_AMOUNT_USD,
+    NO_BUY_PRICE,
     QUOTE_CURRENCY,
-    RANDOM_AMOUNT_MULTIPLIER,
     ConfigError,
     Settings,
     load_settings,
@@ -50,7 +54,6 @@ EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_CONFIG = 2
 EXIT_NOT_PLACED = 3  # validation stopped the order (below minimum, limit reached, ...)
-EXIT_DECLINED = 4
 
 
 class AmountError(Exception):
@@ -77,10 +80,16 @@ class MarketRules:
 # --------------------------------------------------------------------- amount
 
 
-def generate_amount(rng: Random | None = None) -> Decimal:
-    """round(20 * random(), 2) as an exact 2-decimal Decimal (CSPRNG by default)."""
+def max_amount_for_price(best_ask: Decimal) -> Decimal:
+    """MAX_AMOUNT_USD at or below FULL_BUY_PRICE, falling linearly to $0 at NO_BUY_PRICE."""
+    scale = (NO_BUY_PRICE - best_ask) / (NO_BUY_PRICE - FULL_BUY_PRICE)
+    return MAX_AMOUNT_USD * min(max(scale, Decimal("0")), Decimal("1"))
+
+
+def generate_amount(best_ask: Decimal, rng: Random | None = None) -> Decimal:
+    """round(max_amount_for_price(best_ask) * random(), 2) as an exact 2-decimal Decimal (CSPRNG by default)."""
     rng = rng or secrets.SystemRandom()
-    return Decimal(str(round(RANDOM_AMOUNT_MULTIPLIER * rng.random(), 2))).quantize(CENT)
+    return (max_amount_for_price(best_ask) * Decimal(str(rng.random()))).quantize(CENT, rounding=ROUND_HALF_UP)
 
 
 def estimate_quantity(amount: Decimal, rules: MarketRules) -> Decimal:
@@ -288,20 +297,14 @@ def record_from_detail(amount: Decimal, client_oid: str, detail: dict[str, Any])
 
 
 def print_result(record: dict[str, Any]) -> None:
-    print("\n=== Order result ===")
-    print(f"  Status:            {record['status']}")
-    print(f"  Purchase amount:   ${record['requested_usd']} requested, ${record['executed_value_usd'] or '0'} executed")
-    print(f"  Execution price:   {record['avg_price'] or 'n/a'} USD per {BASE_CURRENCY} (average)")
-    print(f"  Quantity received: {record['quantity'] or '0'} {BASE_CURRENCY} (gross)")
-    print(f"  Fees:              {record['fee'] or '0'} {record['fee_currency']}")
-    fee = _decimal_field(record, "fee")
-    qty = _decimal_field(record, "quantity")
-    if record["fee_currency"] == BASE_CURRENCY and fee is not None and qty is not None:
-        print(f"  Net of fees:       {qty - abs(fee)} {BASE_CURRENCY}")
-    print(f"  Order ID:          {record['order_id']}")
-    print(f"  Client order ID:   {record['client_oid']}")
-    if record["reason"]:
-        print(f"  Reason code:       {record['reason']}")
+    qty = _decimal_field(record, "quantity") or Decimal("0")
+    if qty <= 0:
+        reason = f" (reason {record['reason']})" if record["reason"] else ""
+        print(f"Order {record['status']}: nothing bought{reason}.")
+        return
+    spent = (_decimal_field(record, "executed_value_usd") or Decimal("0")).quantize(CENT)
+    fee = f" (fee {record['fee']} {record['fee_currency']})" if record["fee"] else ""
+    print(f"Bought {qty} {BASE_CURRENCY} for ${spent} at ${record['avg_price']}{fee}")
 
 
 def filled_quantity(record: dict[str, Any]) -> Decimal:
@@ -315,7 +318,7 @@ def reconcile_pending(client: CryptoComClient, settings: Settings, journal: Pend
     if pending is None:
         return True
     client_oid = pending["client_oid"]
-    print(f"Found unresolved order from a previous run (client_oid {client_oid}, ${pending['amount']}).")
+    print(f"Checking unfinished order from last run (${pending['amount']})...")
     if not settings.has_credentials:
         print("  Cannot check it without API credentials.")
         return False
@@ -329,7 +332,7 @@ def reconcile_pending(client: CryptoComClient, settings: Settings, journal: Pend
         journal.clear()
         return True
     if detail.get("status") not in TERMINAL_STATUSES:
-        print(f"  Order {detail.get('order_id')} is still {detail.get('status')}. Re-run later.")
+        print(f"  Still {detail.get('status')} on the exchange. Re-run later.")
         return False
     record = record_from_detail(Decimal(pending["amount"]), client_oid, detail)
     append_trade(settings.trades_csv, record)
@@ -341,44 +344,19 @@ def reconcile_pending(client: CryptoComClient, settings: Settings, journal: Pend
 # ------------------------------------------------------------------------ run
 
 
-def prompt_confirmation(amount: Decimal) -> bool:
-    print(f"\n*** LIVE ORDER: market BUY ${amount} of {BASE_CURRENCY} on {INSTRUMENT_NAME} (Crypto.com Exchange) ***")
-    try:
-        answer = input("Type BUY to submit, anything else to cancel: ")
-    except EOFError:
-        return False
-    return answer.strip() == "BUY"
-
-
-def preview_request(settings: Settings, params: dict[str, str]) -> str:
-    body = {
-        "id": "<request id>",
-        "method": "private/create-order",
-        "api_key": "<redacted>",
-        "nonce": "<current time in ms>",
-        "sig": "<HMAC-SHA256 computed at submit>",
-        "params": params,
-    }
-    return f"POST {settings.base_url}/private/create-order\n{json.dumps(body, indent=2)}"
-
-
 def run(
     settings: Settings,
     client: CryptoComClient,
     *,
-    confirm: Callable[[Decimal], bool] = prompt_confirmation,
     rng: Random | None = None,
     sleep: Callable[[float], None] = time.sleep,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
 ) -> int:
-    mode = "DRY RUN" if settings.dry_run else "LIVE"
-    print(f"Mode: {mode} | Exchange: {settings.base_url} | Daily limit: ${settings.daily_limit_usd}")
-
     lock = RunLock(settings.state_dir / ".bot.lock")
     try:
         lock.acquire()
     except AlreadyRunningError:
-        print("Another run is in progress. Exiting without placing an order.")
+        print("Already running in another window.")
         return EXIT_FAILED
     try:
         journal = PendingOrderJournal(settings.state_dir / ".pending_order.json")
@@ -386,35 +364,28 @@ def run(
             print("Refusing to place a new order until the previous one is resolved.")
             return EXIT_FAILED
 
-        amount = generate_amount(rng)
-        print(f"Random purchase amount: ${amount}")
-
         rules = load_market_rules(client)
-        print(
-            f"Market {rules.instrument}: best ask {rules.best_ask}, qty tick {rules.qty_tick_size}, "
-            f"order notional min ${rules.min_notional} / max ${rules.max_notional}"
-        )
+
+        max_amount = max_amount_for_price(rules.best_ask)
+        if max_amount <= 0:
+            print(f"No trade: price ${rules.best_ask} is at or above ${NO_BUY_PRICE}.")
+            return EXIT_NOT_PLACED
+        amount = generate_amount(rules.best_ask, rng)
 
         available: Decimal | None = None
         if settings.has_credentials:
             available = client.get_available_balance(QUOTE_CURRENCY)
-            print(f"Available Exchange {QUOTE_CURRENCY} balance: ${available}")
-        else:
-            print("No API credentials: skipping balance and exchange order-history checks.")
         spent = spent_today(settings, client, now())
         remaining = settings.daily_limit_usd - spent
-        print(f"Spent today: ${spent:.2f} | Remaining daily limit: ${max(remaining, Decimal('0')):.2f}")
 
         try:
             est_qty = validate_amount(amount, rules, remaining, available)
         except AmountError as exc:
-            print(f"NOT PLACED: {exc}")
+            print(f"No trade: {exc}")
             return EXIT_NOT_PLACED
 
         client_oid = str(uuid.uuid4())
         params = build_order_params(amount, client_oid)
-        print(f"Estimated fill: ~{est_qty} {BASE_CURRENCY} at ~{rules.best_ask} (market order; actual may differ)")
-        print("Order request:\n" + preview_request(settings, params))
 
         if settings.dry_run:
             append_trade(settings.trades_csv, {
@@ -423,19 +394,14 @@ def run(
                 "status": "DRY_RUN", "client_oid": client_oid, "avg_price": str(rules.best_ask),
                 "quantity": str(est_qty), "reason": "preview only; no order submitted",
             })
-            print(f"\nDRY RUN: no order submitted. Preview logged to {settings.trades_csv}")
+            print(f"Dry run: would buy ${amount} (~{est_qty} {BASE_CURRENCY} at ${rules.best_ask}). No order sent.")
             return EXIT_OK
-
-        if not confirm(amount):
-            print("Cancelled. No order submitted.")
-            return EXIT_DECLINED
 
         journal.save({"client_oid": client_oid, "amount": str(amount), "created_at": _utc_now()})
         try:
             order_id = submit_order(client, params, sleep=sleep)
         except OrderStateUnknownError as exc:
-            print(f"ORDER STATE UNKNOWN: {exc}")
-            print("Check Exchange order history; the next run will reconcile it before buying again.")
+            print(f"Order status unknown: {exc}. The next run will check it before buying again.")
             return EXIT_FAILED
         except ApiError as exc:
             journal.clear()
@@ -444,16 +410,14 @@ def run(
                 "order_type": "MARKET", "requested_usd": str(amount), "status": "REJECTED",
                 "client_oid": client_oid, "executed_value_usd": "0", "reason": f"{exc.code} {exc.name}",
             })
-            print(f"ORDER REJECTED: {exc}")
+            print(f"Order rejected: {exc.code} {exc.name}")
             return EXIT_FAILED
 
         journal.save({"client_oid": client_oid, "amount": str(amount), "order_id": order_id, "created_at": _utc_now()})
-        print(f"Order accepted (order_id {order_id}); waiting for final status...")
         detail = wait_for_final_status(client, order_id, settings.order_status_timeout, sleep=sleep)
         if detail is None or detail.get("status") not in TERMINAL_STATUSES:
             status = detail.get("status") if detail else "unknown"
-            print(f"UNVERIFIED: order {order_id} still {status} after {settings.order_status_timeout:.0f}s.")
-            print("Not logged yet; the next run will reconcile it.")
+            print(f"Order {order_id} still {status}; the next run will check it.")
             return EXIT_FAILED
 
         record = record_from_detail(amount, client_oid, detail)
@@ -461,11 +425,7 @@ def run(
         journal.clear()
         print_result(record)
         if filled_quantity(record) <= 0:
-            print("\nPurchase did NOT execute.")
             return EXIT_FAILED
-        if record["status"] != "FILLED":
-            print(f"\nWarning: order ended {record['status']} after a partial fill.")
-        print(f"Logged to {settings.trades_csv}")
         return EXIT_OK
     finally:
         lock.release()

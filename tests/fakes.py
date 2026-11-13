@@ -67,9 +67,10 @@ class FixedRandom:
 class FakeExchange:
     """Stands in for CryptoComClient at the method level for orchestration tests."""
 
-    def __init__(self, *, balance: str = "100", history: list[dict] | None = None,
+    def __init__(self, *, balance: str = "100", history: list[dict] | None = None, ask: str = "0.99852",
                  create_effects: list[Any] | None = None, detail_effects: list[Any] | None = None):
         self.balance = Decimal(balance)
+        self.ask = ask
         self.history = history or []
         self.create_effects = list(create_effects or [])
         self.detail_effects = list(detail_effects or [])
@@ -80,7 +81,7 @@ class FakeExchange:
         return dict(USDU_INSTRUMENT) if symbol == "USDU_USD" else None
 
     def get_ticker(self, instrument_name):
-        return {"i": instrument_name, "k": "0.99852", "b": "0.99850"}
+        return {"i": instrument_name, "k": self.ask, "b": "0.99850"}
 
     def get_risk_limits(self, base_currency):
         return {"instrument_name": "USDU", "min_order_notional_usd": "1.0", "max_order_notional_usd": "1000.0"}

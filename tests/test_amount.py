@@ -1,7 +1,7 @@
 import unittest
 from decimal import Decimal
 
-from main import AmountError, MarketRules, build_order_params, generate_amount, validate_amount
+from main import AmountError, MarketRules, build_order_params, generate_amount, max_amount_for_price, validate_amount
 from tests.fakes import FixedRandom
 
 RULES = MarketRules(
@@ -15,18 +15,37 @@ NO_LIMIT = Decimal("1000000")
 
 
 class GenerateAmountTests(unittest.TestCase):
-    def test_formula_is_twenty_times_random_rounded_to_cents(self):
-        cases = {0.0: "0.00", 0.5: "10.00", 0.12345: "2.47", 0.61701: "12.34", 0.9999999: "20.00"}
-        for value, expected in cases.items():
-            with self.subTest(value=value):
-                amount = generate_amount(FixedRandom(value))
+    def test_max_amount_shrinks_linearly_as_price_approaches_one_dollar(self):
+        cases = {
+            "0.90": "20", "0.995": "20", "0.996": "16", "0.9975": "10",
+            "0.99852": "5.92", "0.999": "4", "1.000": "0", "1.002": "0",
+        }
+        for ask, expected in cases.items():
+            with self.subTest(ask=ask):
+                self.assertEqual(max_amount_for_price(Decimal(ask)), Decimal(expected))
+
+    def test_amount_is_scaled_random_rounded_to_cents(self):
+        cases = {
+            ("0.995", 0.5): "10.00", ("0.995", 0.9999999): "20.00", ("0.995", 0.12345): "2.47",
+            ("0.9975", 0.5): "5.00", ("0.99852", 0.5): "2.96", ("1.000", 0.9): "0.00", ("0.995", 0.0): "0.00",
+        }
+        for (ask, value), expected in cases.items():
+            with self.subTest(ask=ask, value=value):
+                amount = generate_amount(Decimal(ask), FixedRandom(value))
                 self.assertEqual(amount, Decimal(expected))
                 self.assertEqual(amount.as_tuple().exponent, -2)
 
-    def test_default_generator_stays_within_zero_to_twenty(self):
+    def test_cheaper_price_never_buys_less_for_the_same_draw(self):
+        asks = [Decimal("0.990"), Decimal("0.995"), Decimal("0.997"), Decimal("0.999"), Decimal("1.000")]
+        for value in (0.1, 0.5, 0.9):
+            amounts = [generate_amount(ask, FixedRandom(value)) for ask in asks]
+            self.assertEqual(amounts, sorted(amounts, reverse=True))
+
+    def test_default_generator_stays_within_price_scaled_range(self):
+        ask = Decimal("0.998")
         for _ in range(2000):
-            amount = generate_amount()
-            self.assertTrue(Decimal("0") <= amount <= Decimal("20"))
+            amount = generate_amount(ask)
+            self.assertTrue(Decimal("0") <= amount <= Decimal("8"))
             self.assertEqual(amount, amount.quantize(Decimal("0.01")))
 
 

@@ -197,10 +197,10 @@ class RunSafetyTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_bot(self, settings, exchange, confirm=lambda _a: True, rand=0.5):
+    def run_bot(self, settings, exchange, rand=0.5):
         out = io.StringIO()
         with redirect_stdout(out):
-            code = main.run(settings, exchange, confirm=confirm, rng=FixedRandom(rand), sleep=lambda _s: None,
+            code = main.run(settings, exchange, rng=FixedRandom(rand), sleep=lambda _s: None,
                             now=lambda: datetime.now(timezone.utc))
         return code, out.getvalue()
 
@@ -213,34 +213,34 @@ class RunSafetyTests(unittest.TestCase):
         code, out = self.run_bot(make_settings(self.tmp, dry_run=True), exchange)
         self.assertEqual(code, main.EXIT_OK)
         self.assertEqual(exchange.created, [])
-        self.assertIn('"notional": "10.00"', out)
+        self.assertIn("would buy $2.96", out)  # $20 * 0.296 (ask 0.99852) * 0.5
         self.assertNotIn("test-secret", out)
         self.assertNotIn("test-key", out)
         self.assertEqual([r["status"] for r in self.rows()], ["DRY_RUN"])
         self.assertEqual(list(self.rows()[0]), CSV_FIELDS)
 
-    def test_live_requires_confirmation(self):
-        exchange = FakeExchange()
-        code, _ = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, confirm=lambda _a: False)
-        self.assertEqual(code, main.EXIT_DECLINED)
-        self.assertEqual(exchange.created, [])
-
-    def test_daily_limit_blocks_before_confirmation(self):
-        exchange = FakeExchange(history=[{"side": "BUY", "cumulative_value": "45.00"}])
-        asked = []
-        code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange,
-                                 confirm=lambda a: asked.append(a) or True)
+    def test_daily_limit_blocks_order(self):
+        exchange = FakeExchange(history=[{"side": "BUY", "cumulative_value": "48.00"}])
+        code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange)
         self.assertEqual(code, main.EXIT_NOT_PLACED)
         self.assertIn("daily limit", out)
-        self.assertEqual(asked, [])
         self.assertEqual(exchange.created, [])
 
     def test_below_exchange_minimum_is_not_submitted(self):
         exchange = FakeExchange()
-        code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, rand=0.02)  # $0.40
+        code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, rand=0.1)  # $5.92 * 0.1 = $0.59
         self.assertEqual(code, main.EXIT_NOT_PLACED)
         self.assertIn("below the exchange minimum", out)
         self.assertEqual(exchange.created, [])
+
+    def test_price_at_or_above_one_dollar_buys_nothing(self):
+        for ask in ("1.00000", "1.00010"):
+            with self.subTest(ask=ask):
+                exchange = FakeExchange(ask=ask)
+                code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, rand=0.99)
+                self.assertEqual(code, main.EXIT_NOT_PLACED)
+                self.assertIn("at or above $1.000", out)
+                self.assertEqual(exchange.created, [])
 
     def test_live_fill_is_verified_logged_and_journal_cleared(self):
         filled = {"order_id": "123", "status": "FILLED", "avg_price": "0.99852", "cumulative_quantity": "10.0",
@@ -252,7 +252,7 @@ class RunSafetyTests(unittest.TestCase):
         self.assertEqual(len(exchange.created), 1)
         row = self.rows()[0]
         self.assertEqual((row["mode"], row["status"], row["order_id"], row["quantity"]), ("LIVE", "FILLED", "123", "10.0"))
-        self.assertIn("Net of fees:       9.995 USDU", out)
+        self.assertEqual(out.strip(), "Bought 10.0 USDU for $9.99 at $0.99852 (fee 0.005 USDU)")
         self.assertIsNone(PendingOrderJournal(self.tmp / ".pending_order.json").load())
 
     def test_rejected_live_order_reports_failure(self):
@@ -260,7 +260,7 @@ class RunSafetyTests(unittest.TestCase):
         exchange = FakeExchange(create_effects=[{"order_id": "5"}], detail_effects=[filled_nothing])
         code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange)
         self.assertEqual(code, main.EXIT_FAILED)
-        self.assertIn("did NOT execute", out)
+        self.assertIn("nothing bought", out)
         self.assertEqual(self.rows()[0]["status"], "REJECTED")
 
     def test_unverified_order_blocks_next_live_run(self):
