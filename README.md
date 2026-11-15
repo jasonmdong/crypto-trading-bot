@@ -22,3 +22,11 @@ Buys a random amount of USDU on the Crypto.com Exchange each time you run it, si
    ```
 
    Set `DRY_RUN=false` in `.env` to trade for real. Each run then buys immediately, with no confirmation.
+
+## Run once a day at a random time
+
+```bash
+python run.py
+```
+
+Runs `main.py` at a random time in the rest of today, then once a day at a random time, printing each result. Stop it with Ctrl-C. It only runs while the window (or SSH session) stays open.
