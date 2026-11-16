@@ -24,10 +24,10 @@ class GenerateAmountTests(unittest.TestCase):
             with self.subTest(ask=ask):
                 self.assertEqual(max_amount_for_price(Decimal(ask)), Decimal(expected))
 
-    def test_amount_is_scaled_random_rounded_to_cents(self):
+    def test_amount_is_price_scaled_random_rounded_to_cents(self):
         cases = {
             ("0.995", 0.5): "10.00", ("0.995", 0.9999999): "20.00", ("0.995", 0.12345): "2.47",
-            ("0.9975", 0.5): "5.00", ("0.99852", 0.5): "2.96", ("1.000", 0.9): "0.00", ("0.995", 0.0): "0.00",
+            ("0.9975", 0.5): "5.00", ("0.99852", 0.5): "2.96", ("0.995", 0.1): "2.00",
         }
         for (ask, value), expected in cases.items():
             with self.subTest(ask=ask, value=value):
@@ -35,9 +35,15 @@ class GenerateAmountTests(unittest.TestCase):
                 self.assertEqual(amount, Decimal(expected))
                 self.assertEqual(amount.as_tuple().exponent, -2)
 
+    def test_amount_below_two_dollars_is_rerolled(self):
+        # 0.995: $20 * 0.05 = $1.00 rejected, then $20 * 0.5 = $10.00
+        self.assertEqual(generate_amount(Decimal("0.995"), FixedRandom(0.05, 0.5)), Decimal("10.00"))
+        # 0.99852: $5.92 * 0.1 = $0.59 and * 0.3 = $1.78 rejected, then * 0.5 = $2.96
+        self.assertEqual(generate_amount(Decimal("0.99852"), FixedRandom(0.1, 0.3, 0.5)), Decimal("2.96"))
+
     def test_cheaper_price_never_buys_less_for_the_same_draw(self):
-        asks = [Decimal("0.990"), Decimal("0.995"), Decimal("0.997"), Decimal("0.999"), Decimal("1.000")]
-        for value in (0.1, 0.5, 0.9):
+        asks = [Decimal("0.990"), Decimal("0.995"), Decimal("0.997"), Decimal("0.999")]
+        for value in (0.6, 0.9):
             amounts = [generate_amount(ask, FixedRandom(value)) for ask in asks]
             self.assertEqual(amounts, sorted(amounts, reverse=True))
 
@@ -45,7 +51,7 @@ class GenerateAmountTests(unittest.TestCase):
         ask = Decimal("0.998")
         for _ in range(2000):
             amount = generate_amount(ask)
-            self.assertTrue(Decimal("0") <= amount <= Decimal("8"))
+            self.assertTrue(Decimal("2") <= amount <= Decimal("8"))
             self.assertEqual(amount, amount.quantize(Decimal("0.01")))
 
 

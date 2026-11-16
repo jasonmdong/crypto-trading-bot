@@ -26,6 +26,7 @@ from config import (
     BASE_CURRENCY,
     FULL_BUY_PRICE,
     INSTRUMENT_NAME,
+    MIN_AMOUNT_USD,
     MAX_AMOUNT_USD,
     NO_BUY_PRICE,
     QUOTE_CURRENCY,
@@ -87,9 +88,16 @@ def max_amount_for_price(best_ask: Decimal) -> Decimal:
 
 
 def generate_amount(best_ask: Decimal, rng: Random | None = None) -> Decimal:
-    """round(max_amount_for_price(best_ask) * random(), 2) as an exact 2-decimal Decimal (CSPRNG by default)."""
+    """Random amount from $0 to max_amount_for_price(best_ask), in cents; reroll while below MIN_AMOUNT_USD.
+
+    Callers must first check max_amount_for_price(best_ask) >= MIN_AMOUNT_USD, or this never ends.
+    """
     rng = rng or secrets.SystemRandom()
-    return (max_amount_for_price(best_ask) * Decimal(str(rng.random()))).quantize(CENT, rounding=ROUND_HALF_UP)
+    max_amount = max_amount_for_price(best_ask)
+    while True:
+        amount = (max_amount * Decimal(str(rng.random()))).quantize(CENT, rounding=ROUND_HALF_UP)
+        if amount >= MIN_AMOUNT_USD:
+            return amount
 
 
 def estimate_quantity(amount: Decimal, rules: MarketRules) -> Decimal:
@@ -367,8 +375,8 @@ def run(
         rules = load_market_rules(client)
 
         max_amount = max_amount_for_price(rules.best_ask)
-        if max_amount <= 0:
-            print(f"No trade: price ${rules.best_ask} is at or above ${NO_BUY_PRICE}.")
+        if max_amount < MIN_AMOUNT_USD:
+            print(f"No trade: price ${rules.best_ask} is too close to ${NO_BUY_PRICE} (max buy ${max_amount:.2f} < ${MIN_AMOUNT_USD}).")
             return EXIT_NOT_PLACED
         amount = generate_amount(rules.best_ask, rng)
 

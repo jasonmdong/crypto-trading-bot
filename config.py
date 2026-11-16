@@ -25,9 +25,12 @@ INSTRUMENT_NAME = "USDU_USD"
 BASE_CURRENCY = "USDU"
 QUOTE_CURRENCY = "USD"
 
-# Purchase amount = round(max_amount * random(), 2), where max_amount depends on
-# the current best ask: the full MAX_AMOUNT_USD at or below FULL_BUY_PRICE,
-# shrinking linearly to $0 at NO_BUY_PRICE. At or above NO_BUY_PRICE nothing is bought.
+# Purchase amount = random between $0 and max_amount (rounded to cents),
+# where max_amount depends on the current best ask: the full MAX_AMOUNT_USD at or
+# below FULL_BUY_PRICE, shrinking linearly to $0 at NO_BUY_PRICE.
+# Amounts below MIN_AMOUNT_USD are rerolled; if max_amount itself is below it,
+# nothing is bought. Keep MIN_AMOUNT_USD above the exchange's $1 order minimum.
+MIN_AMOUNT_USD = Decimal("2.00")
 MAX_AMOUNT_USD = Decimal("20")
 FULL_BUY_PRICE = Decimal("0.995")
 NO_BUY_PRICE = Decimal("1.000")

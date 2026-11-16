@@ -213,7 +213,7 @@ class RunSafetyTests(unittest.TestCase):
         code, out = self.run_bot(make_settings(self.tmp, dry_run=True), exchange)
         self.assertEqual(code, main.EXIT_OK)
         self.assertEqual(exchange.created, [])
-        self.assertIn("would buy $2.96", out)  # $20 * 0.296 (ask 0.99852) * 0.5
+        self.assertIn("would buy $2.96", out)  # $5.92 max at ask 0.99852 * 0.5
         self.assertNotIn("test-secret", out)
         self.assertNotIn("test-key", out)
         self.assertEqual([r["status"] for r in self.rows()], ["DRY_RUN"])
@@ -226,20 +226,13 @@ class RunSafetyTests(unittest.TestCase):
         self.assertIn("daily limit", out)
         self.assertEqual(exchange.created, [])
 
-    def test_below_exchange_minimum_is_not_submitted(self):
-        exchange = FakeExchange()
-        code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, rand=0.1)  # $5.92 * 0.1 = $0.59
-        self.assertEqual(code, main.EXIT_NOT_PLACED)
-        self.assertIn("below the exchange minimum", out)
-        self.assertEqual(exchange.created, [])
-
-    def test_price_at_or_above_one_dollar_buys_nothing(self):
-        for ask in ("1.00000", "1.00010"):
+    def test_price_too_close_to_one_dollar_buys_nothing(self):
+        for ask in ("0.99960", "1.00000", "1.00010"):  # max buy $1.60, $0, $0
             with self.subTest(ask=ask):
                 exchange = FakeExchange(ask=ask)
                 code, out = self.run_bot(make_settings(self.tmp, dry_run=False), exchange, rand=0.99)
                 self.assertEqual(code, main.EXIT_NOT_PLACED)
-                self.assertIn("at or above $1.000", out)
+                self.assertIn("too close to $1.000", out)
                 self.assertEqual(exchange.created, [])
 
     def test_live_fill_is_verified_logged_and_journal_cleared(self):

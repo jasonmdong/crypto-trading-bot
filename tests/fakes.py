@@ -57,11 +57,13 @@ class Ticker:
 
 
 class FixedRandom:
-    def __init__(self, value: float):
-        self.value = value
+    """Returns the given values in order, then repeats the last one."""
+
+    def __init__(self, *values: float):
+        self.values = list(values)
 
     def random(self) -> float:
-        return self.value
+        return self.values.pop(0) if len(self.values) > 1 else self.values[0]
 
 
 class FakeExchange:
