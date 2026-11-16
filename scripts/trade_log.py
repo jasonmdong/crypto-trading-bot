@@ -60,8 +60,8 @@ def _decimal(text: str | None) -> Decimal:
         return Decimal("0")
 
 
-def live_spend_on(path: Path, day: date) -> Decimal:
-    """USD committed by LIVE orders logged on local calendar `day`.
+def live_spend_on(path: Path, day: date, instrument: str, side: str) -> Decimal:
+    """USD committed by LIVE `side` orders on `instrument` logged on local calendar `day`.
 
     Final orders count their executed value; unverified orders count the full
     requested amount so an unknown outcome can never free up budget.
@@ -71,7 +71,7 @@ def live_spend_on(path: Path, day: date) -> Decimal:
     total = Decimal("0")
     with path.open(newline="", encoding="utf-8") as handle:
         for row in csv.DictReader(handle):
-            if row.get("mode") != "LIVE":
+            if row.get("mode") != "LIVE" or row.get("instrument") != instrument or row.get("side") != side:
                 continue
             try:
                 logged = datetime.fromisoformat(row["timestamp_utc"]).astimezone()

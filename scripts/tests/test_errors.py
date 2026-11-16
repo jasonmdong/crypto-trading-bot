@@ -22,7 +22,7 @@ from crypto_client import (
     RateLimitError,
 )
 from trade_log import CSV_FIELDS, PendingOrderJournal, append_trade, live_spend_on
-from tests.fakes import FakeExchange, FakeResponse, FakeSession, FixedRandom, Ticker, make_settings
+from tests.fakes import USDU_SELL, FakeExchange, FakeResponse, FakeSession, FixedRandom, Ticker, make_settings
 
 
 def api_error(code: int, http: int = 400, message: str = "", original: str | None = None) -> FakeResponse:
@@ -163,6 +163,29 @@ class ConfigTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ConfigError):
                 load_settings({"DAILY_LIMIT_USD": value})
 
+    def test_defaults_are_the_usdu_buyer(self):
+        strategy = load_settings({}).strategy
+        self.assertEqual((strategy.instrument, strategy.side), ("USDU_USD", "BUY"))
+        self.assertEqual((strategy.full_price, strategy.no_trade_price), (Decimal("0.995"), Decimal("1.000")))
+
+    def test_symbol_and_side_are_configurable(self):
+        strategy = load_settings({"SYMBOL": "btc", "SIDE": "sell", "FULL_PRICE": "120000",
+                                  "NO_TRADE_PRICE": "100000", "MAX_AMOUNT_USD": "50"}).strategy
+        self.assertEqual((strategy.instrument, strategy.side), ("BTC_USD", "SELL"))
+        self.assertEqual(strategy.max_amount_usd, Decimal("50"))
+
+    def test_invalid_strategy_is_rejected(self):
+        cases = [
+            {"SIDE": "HOLD"},
+            {"SYMBOL": "BTC_USD"},
+            {"MIN_AMOUNT_USD": "30", "MAX_AMOUNT_USD": "20"},
+            {"FULL_PRICE": "1.0", "NO_TRADE_PRICE": "0.99"},  # buying more as price rises
+            {"SIDE": "SELL"},  # default prices are for buying
+        ]
+        for env in cases:
+            with self.subTest(env=env), self.assertRaises(ConfigError):
+                load_settings(env)
+
     def test_repr_hides_credentials(self):
         settings = load_settings({"CRYPTO_COM_API_KEY": "visible-key", "CRYPTO_COM_API_SECRET": "hidden-secret"})
         self.assertNotIn("hidden-secret", repr(settings))
@@ -175,18 +198,24 @@ class DailySpendTests(unittest.TestCase):
             path = Path(tmp) / "trades.csv"
             today = datetime.now().astimezone()
             iso = today.isoformat()
+            buy = {"instrument": "USDU_USD", "side": "BUY"}
             rows = [
-                {"timestamp_utc": iso, "mode": "LIVE", "status": "FILLED", "requested_usd": "5.00", "executed_value_usd": "4.99"},
-                {"timestamp_utc": iso, "mode": "LIVE", "status": "REJECTED", "requested_usd": "9.00", "executed_value_usd": "0"},
-                {"timestamp_utc": iso, "mode": "LIVE", "status": "ACTIVE", "requested_usd": "3.00", "executed_value_usd": ""},
-                {"timestamp_utc": iso, "mode": "DRY_RUN", "status": "DRY_RUN", "requested_usd": "19.00"},
-                {"timestamp_utc": "2020-01-01T12:00:00+00:00", "mode": "LIVE", "status": "FILLED",
+                {**buy, "timestamp_utc": iso, "mode": "LIVE", "status": "FILLED", "requested_usd": "5.00", "executed_value_usd": "4.99"},
+                {**buy, "timestamp_utc": iso, "mode": "LIVE", "status": "REJECTED", "requested_usd": "9.00", "executed_value_usd": "0"},
+                {**buy, "timestamp_utc": iso, "mode": "LIVE", "status": "ACTIVE", "requested_usd": "3.00", "executed_value_usd": ""},
+                {**buy, "timestamp_utc": iso, "mode": "DRY_RUN", "status": "DRY_RUN", "requested_usd": "19.00"},
+                {**buy, "timestamp_utc": "2020-01-01T12:00:00+00:00", "mode": "LIVE", "status": "FILLED",
                  "requested_usd": "8.00", "executed_value_usd": "8.00"},
+                {"instrument": "USDU_USD", "side": "SELL", "timestamp_utc": iso, "mode": "LIVE", "status": "FILLED",
+                 "requested_usd": "6.00", "executed_value_usd": "6.01"},
+                {"instrument": "BTC_USD", "side": "BUY", "timestamp_utc": iso, "mode": "LIVE", "status": "FILLED",
+                 "requested_usd": "7.00", "executed_value_usd": "7.00"},
             ]
             for row in rows:
                 append_trade(path, row)
-            self.assertEqual(live_spend_on(path, today.date()), Decimal("7.99"))
-            self.assertEqual(live_spend_on(path, date(2000, 1, 1)), Decimal("0"))
+            self.assertEqual(live_spend_on(path, today.date(), "USDU_USD", "BUY"), Decimal("7.99"))
+            self.assertEqual(live_spend_on(path, today.date(), "USDU_USD", "SELL"), Decimal("6.01"))
+            self.assertEqual(live_spend_on(path, date(2000, 1, 1), "USDU_USD", "BUY"), Decimal("0"))
 
 
 class RunSafetyTests(unittest.TestCase):
@@ -265,6 +294,26 @@ class RunSafetyTests(unittest.TestCase):
         self.assertIn("Refusing to place a new order", out)
         self.assertEqual(exchange.created, [])
         self.assertIsNotNone(journal.load())
+
+    def test_live_sell_uses_bid_and_coin_quantity(self):
+        # bid 1.0025 -> max $10; draw 0.5 -> $5.00 -> 4.9 USDU at a 0.1 tick
+        filled = {"order_id": "9", "status": "FILLED", "avg_price": "1.0025", "cumulative_quantity": "4.9",
+                  "cumulative_value": "4.91225", "instrument_name": "USDU_USD", "side": "SELL"}
+        exchange = FakeExchange(bid="1.0025", balance="50", create_effects=[{"order_id": "9"}], detail_effects=[filled])
+        code, out = self.run_bot(make_settings(self.tmp, dry_run=False, strategy=USDU_SELL), exchange)
+        self.assertEqual(code, main.EXIT_OK)
+        self.assertEqual(exchange.created[0]["side"], "SELL")
+        self.assertEqual(exchange.created[0]["quantity"], "4.9")
+        self.assertNotIn("notional", exchange.created[0])
+        self.assertEqual(out.strip(), "Sold 4.9 USDU for $4.91 at $1.0025")
+        self.assertEqual(self.rows()[0]["side"], "SELL")
+
+    def test_sell_below_no_trade_price_sells_nothing(self):
+        exchange = FakeExchange(bid="0.99990")
+        code, out = self.run_bot(make_settings(self.tmp, dry_run=False, strategy=USDU_SELL), exchange)
+        self.assertEqual(code, main.EXIT_NOT_PLACED)
+        self.assertIn("max sell $0.00", out)
+        self.assertEqual(exchange.created, [])
 
     def test_unavailable_market_never_falls_back(self):
         exchange = FakeExchange()

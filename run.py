@@ -3,7 +3,7 @@
 Usage:  python run.py
 
 The first run is at a random time in the rest of today, then once per day at a
-random time. Each run is a fresh `python main.py`, so .env changes apply.
+random time. Each run is a fresh `python scripts/main.py`, so .env changes apply.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-MAIN = Path(__file__).resolve().parent / "main.py"
+MAIN = Path(__file__).resolve().parent / "scripts" / "main.py"
 
 
 def next_midnight(moment: datetime) -> datetime:

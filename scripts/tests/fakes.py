@@ -7,7 +7,12 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from config import Settings
+from config import Settings, Strategy
+
+USDU_BUY = Strategy(symbol="USDU", side="BUY", min_amount_usd=Decimal("2.00"), max_amount_usd=Decimal("20"),
+                    full_price=Decimal("0.995"), no_trade_price=Decimal("1.000"))
+USDU_SELL = Strategy(symbol="USDU", side="SELL", min_amount_usd=Decimal("2.00"), max_amount_usd=Decimal("20"),
+                     full_price=Decimal("1.005"), no_trade_price=Decimal("1.000"))
 
 USDU_INSTRUMENT = {
     "symbol": "USDU_USD",
@@ -69,10 +74,11 @@ class FixedRandom:
 class FakeExchange:
     """Stands in for CryptoComClient at the method level for orchestration tests."""
 
-    def __init__(self, *, balance: str = "100", history: list[dict] | None = None, ask: str = "0.99852",
+    def __init__(self, *, balance: str = "100", history: list[dict] | None = None, ask: str = "0.99852", bid: str = "0.99850",
                  create_effects: list[Any] | None = None, detail_effects: list[Any] | None = None):
         self.balance = Decimal(balance)
         self.ask = ask
+        self.bid = bid
         self.history = history or []
         self.create_effects = list(create_effects or [])
         self.detail_effects = list(detail_effects or [])
@@ -83,7 +89,7 @@ class FakeExchange:
         return dict(USDU_INSTRUMENT) if symbol == "USDU_USD" else None
 
     def get_ticker(self, instrument_name):
-        return {"i": instrument_name, "k": self.ask, "b": "0.99850"}
+        return {"i": instrument_name, "k": self.ask, "b": self.bid}
 
     def get_risk_limits(self, base_currency):
         return {"instrument_name": "USDU", "min_order_notional_usd": "1.0", "max_order_notional_usd": "1000.0"}
@@ -109,7 +115,8 @@ class FakeExchange:
         return effect
 
 
-def make_settings(tmp: Path, *, dry_run: bool, credentials: bool = True, daily_limit: str = "50") -> Settings:
+def make_settings(tmp: Path, *, dry_run: bool, credentials: bool = True, daily_limit: str = "50",
+                  strategy: Strategy = USDU_BUY) -> Settings:
     return Settings(
         api_key="test-key" if credentials else "",
         api_secret="test-secret" if credentials else "",
@@ -119,4 +126,5 @@ def make_settings(tmp: Path, *, dry_run: bool, credentials: bool = True, daily_l
         trades_csv=tmp / "trades.csv",
         request_timeout=5.0,
         order_status_timeout=1.0,
+        strategy=strategy,
     )

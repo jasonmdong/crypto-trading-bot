@@ -9,19 +9,13 @@ Buys a random amount of USDU on the Crypto.com Exchange each time you run it, si
 
    ```bash
    python3 -m venv .venv
-   source .venv/bin/activate
+   source .venv/bin/activate # .venv\Scripts\Activate.ps1 for Windows
    pip install -r requirements.txt
    cp .env.example .env
    ```
 
-3. Add your API key and secret to `.env`.
-4. Run:
-
-   ```bash
-   python main.py
-   ```
-
-   Set `DRY_RUN=false` in `.env` to trade for real. Each run then buys immediately, with no confirmation.
+3. Add your API keys and secrets to `.env`, then set up the symbol and side to spend.
+4.  You're good to go! Set `DRY_RUN=false` in `.env` to trade for real. Each run then buys immediately, with no confirmation.
 
 ## Run once a day at a random time
 
@@ -29,4 +23,4 @@ Buys a random amount of USDU on the Crypto.com Exchange each time you run it, si
 python run.py
 ```
 
-Runs `main.py` at a random time in the rest of today, then once a day at a random time, printing each result. Stop it with Ctrl-C. It only runs while the window (or SSH session) stays open.
+Runs `scripts/main.py`(buys) at a random time in the rest of today, then once a day at a random time, printing each result. Stop it with Ctrl-C. It only runs while the window (or SSH session) stays open.

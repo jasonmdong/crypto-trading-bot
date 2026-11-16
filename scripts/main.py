@@ -1,7 +1,7 @@
-"""Buy a random, price-scaled USD amount of USDU on the Crypto.com Exchange.
+"""Buy or sell a random, price-scaled USD amount of one coin on the Crypto.com Exchange.
 
-The cheaper USDU is below $1, the larger the random buy (up to $20); at $1 or
-above nothing is bought. See MAX_AMOUNT_USD / FULL_BUY_PRICE / NO_BUY_PRICE.
+What to trade comes from .env (SYMBOL, SIDE, MIN/MAX_AMOUNT_USD, FULL_PRICE,
+NO_TRADE_PRICE); see config.Strategy for how the amount is chosen.
 
 Usage:  python main.py
 
@@ -22,18 +22,7 @@ from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from random import Random
 from typing import Any
 
-from config import (
-    BASE_CURRENCY,
-    FULL_BUY_PRICE,
-    INSTRUMENT_NAME,
-    MIN_AMOUNT_USD,
-    MAX_AMOUNT_USD,
-    NO_BUY_PRICE,
-    QUOTE_CURRENCY,
-    ConfigError,
-    Settings,
-    load_settings,
-)
+from config import QUOTE_CURRENCY, ConfigError, Settings, Strategy, load_settings
 from crypto_client import (
     ApiError,
     CryptoComClient,
@@ -62,7 +51,7 @@ class AmountError(Exception):
 
 
 class MarketUnavailableError(Exception):
-    """USDU_USD is missing or not tradable. The bot never substitutes another asset."""
+    """The configured instrument is missing or not tradable. The bot never substitutes another asset."""
 
 
 class OrderStateUnknownError(Exception):
@@ -75,62 +64,69 @@ class MarketRules:
     qty_tick_size: Decimal
     min_notional: Decimal | None
     max_notional: Decimal | None
-    best_ask: Decimal
+    price: Decimal  # best ask for BUY, best bid for SELL
 
 
 # --------------------------------------------------------------------- amount
 
 
-def max_amount_for_price(best_ask: Decimal) -> Decimal:
-    """MAX_AMOUNT_USD at or below FULL_BUY_PRICE, falling linearly to $0 at NO_BUY_PRICE."""
-    scale = (NO_BUY_PRICE - best_ask) / (NO_BUY_PRICE - FULL_BUY_PRICE)
-    return MAX_AMOUNT_USD * min(max(scale, Decimal("0")), Decimal("1"))
+def max_amount_for_price(price: Decimal, strategy: Strategy) -> Decimal:
+    """Full max_amount_usd at or past full_price, falling linearly to $0 at no_trade_price."""
+    scale = (strategy.no_trade_price - price) / (strategy.no_trade_price - strategy.full_price)
+    return strategy.max_amount_usd * min(max(scale, Decimal("0")), Decimal("1"))
 
 
-def generate_amount(best_ask: Decimal, rng: Random | None = None) -> Decimal:
-    """Random amount from $0 to max_amount_for_price(best_ask), in cents; reroll while below MIN_AMOUNT_USD.
+def generate_amount(price: Decimal, strategy: Strategy, rng: Random | None = None) -> Decimal:
+    """Random amount from $0 to max_amount_for_price, in cents; reroll while below min_amount_usd.
 
-    Callers must first check max_amount_for_price(best_ask) >= MIN_AMOUNT_USD, or this never ends.
+    Callers must first check max_amount_for_price(...) >= min_amount_usd, or this never ends.
     """
     rng = rng or secrets.SystemRandom()
-    max_amount = max_amount_for_price(best_ask)
+    max_amount = max_amount_for_price(price, strategy)
     while True:
         amount = (max_amount * Decimal(str(rng.random()))).quantize(CENT, rounding=ROUND_HALF_UP)
-        if amount >= MIN_AMOUNT_USD:
+        if amount >= strategy.min_amount_usd:
             return amount
 
 
 def estimate_quantity(amount: Decimal, rules: MarketRules) -> Decimal:
-    raw = amount / rules.best_ask
+    raw = amount / rules.price
     return (raw // rules.qty_tick_size) * rules.qty_tick_size
 
 
 def validate_amount(
     amount: Decimal,
     rules: MarketRules,
+    strategy: Strategy,
     remaining_daily_usd: Decimal,
-    available_usd: Decimal | None = None,
+    available: Decimal | None = None,
 ) -> Decimal:
-    """Return the estimated USDU quantity, or raise AmountError explaining why not."""
+    """Return the (estimated) coin quantity, or raise AmountError explaining why not.
+
+    `available` is the free USD balance for a BUY, or the free coin balance for a SELL.
+    """
+    symbol = strategy.symbol
     if not amount.is_finite() or amount <= 0:
         raise AmountError(f"amount must be positive, got ${amount}")
     if amount != amount.quantize(CENT):
         raise AmountError(f"amount must have at most 2 decimal places, got {amount}")
     if rules.min_notional is not None and amount < rules.min_notional:
-        raise AmountError(f"${amount} is below the exchange minimum order of ${rules.min_notional} for {BASE_CURRENCY}")
+        raise AmountError(f"${amount} is below the exchange minimum order of ${rules.min_notional} for {symbol}")
     if rules.max_notional is not None and amount > rules.max_notional:
-        raise AmountError(f"${amount} exceeds the exchange maximum order of ${rules.max_notional} for {BASE_CURRENCY}")
+        raise AmountError(f"${amount} exceeds the exchange maximum order of ${rules.max_notional} for {symbol}")
     if amount > remaining_daily_usd:
         raise AmountError(
             f"${amount} exceeds the remaining daily limit of ${max(remaining_daily_usd, Decimal('0')):.2f}"
         )
-    if available_usd is not None and amount > available_usd:
-        raise AmountError(f"${amount} exceeds the available Exchange {QUOTE_CURRENCY} balance of ${available_usd}")
+    if strategy.is_buy and available is not None and amount > available:
+        raise AmountError(f"${amount} exceeds the available Exchange {QUOTE_CURRENCY} balance of ${available}")
     quantity = estimate_quantity(amount, rules)
     if quantity < rules.qty_tick_size:
         raise AmountError(
-            f"${amount} buys ~{amount / rules.best_ask:.4f} {BASE_CURRENCY}, below the {rules.qty_tick_size} quantity tick"
+            f"${amount} is ~{amount / rules.price:.4f} {symbol}, below the {rules.qty_tick_size} quantity tick"
         )
+    if not strategy.is_buy and available is not None and quantity > available:
+        raise AmountError(f"selling {quantity} {symbol} exceeds the available Exchange {symbol} balance of {available}")
     return quantity
 
 
@@ -147,55 +143,72 @@ def _decimal_field(data: dict[str, Any], key: str) -> Decimal | None:
         return None
 
 
-def load_market_rules(client: CryptoComClient) -> MarketRules:
-    instrument = client.get_instrument(INSTRUMENT_NAME)
+def load_market_rules(client: CryptoComClient, strategy: Strategy) -> MarketRules:
+    name = strategy.instrument
+    instrument = client.get_instrument(name)
     if instrument is None:
-        raise MarketUnavailableError(f"{INSTRUMENT_NAME} is not listed on the Crypto.com Exchange. No order placed.")
-    if instrument.get("base_ccy") != BASE_CURRENCY or instrument.get("quote_ccy") != QUOTE_CURRENCY:
-        raise MarketUnavailableError(f"{INSTRUMENT_NAME} reports unexpected currencies: {instrument}")
+        raise MarketUnavailableError(f"{name} is not listed on the Crypto.com Exchange. No order placed.")
+    if instrument.get("base_ccy") != strategy.symbol or instrument.get("quote_ccy") != QUOTE_CURRENCY:
+        raise MarketUnavailableError(f"{name} reports unexpected currencies: {instrument}")
     if instrument.get("tradable") is not True:
-        raise MarketUnavailableError(f"{INSTRUMENT_NAME} is listed but not tradable right now. No order placed.")
+        raise MarketUnavailableError(f"{name} is listed but not tradable right now. No order placed.")
     qty_tick = _decimal_field(instrument, "qty_tick_size")
     if qty_tick is None or qty_tick <= 0:
-        raise MarketUnavailableError(f"{INSTRUMENT_NAME} has no usable qty_tick_size: {instrument.get('qty_tick_size')!r}")
+        raise MarketUnavailableError(f"{name} has no usable qty_tick_size: {instrument.get('qty_tick_size')!r}")
 
-    ticker = client.get_ticker(INSTRUMENT_NAME) or {}
-    best_ask = _decimal_field(ticker, "k")
-    if best_ask is None or best_ask <= 0:
-        raise MarketUnavailableError(f"{INSTRUMENT_NAME} has no ask price (empty order book). No order placed.")
+    # A market BUY fills against the asks, a market SELL against the bids.
+    ticker = client.get_ticker(name) or {}
+    price = _decimal_field(ticker, "k" if strategy.is_buy else "b")
+    if price is None or price <= 0:
+        book_side = "ask" if strategy.is_buy else "bid"
+        raise MarketUnavailableError(f"{name} has no {book_side} price (empty order book). No order placed.")
 
-    limits = client.get_risk_limits(BASE_CURRENCY) or {}
+    limits = client.get_risk_limits(strategy.symbol) or {}
     return MarketRules(
-        instrument=INSTRUMENT_NAME,
+        instrument=name,
         qty_tick_size=qty_tick,
         min_notional=_decimal_field(limits, "min_order_notional_usd"),
         max_notional=_decimal_field(limits, "max_order_notional_usd"),
-        best_ask=best_ask,
+        price=price,
     )
 
 
-def build_order_params(amount: Decimal, client_oid: str) -> dict[str, str]:
-    """Market BUY spending exactly `amount` USD (documented `notional` field)."""
-    return {
-        "instrument_name": INSTRUMENT_NAME,
-        "side": "BUY",
+def build_order_params(strategy: Strategy, amount: Decimal, quantity: Decimal, client_oid: str) -> dict[str, str]:
+    """Market BUY spending exactly `amount` USD (`notional`), or market SELL of `quantity` coins.
+
+    The exchange only accepts `notional` on market buys, so sells are sized in coins.
+    """
+    params = {
+        "instrument_name": strategy.instrument,
+        "side": strategy.side,
         "type": "MARKET",
-        "notional": str(amount.quantize(CENT)),
         "client_oid": client_oid,
         "spot_margin": "SPOT",  # never borrow
     }
+    if strategy.is_buy:
+        params["notional"] = str(amount.quantize(CENT))
+    else:
+        params["quantity"] = format(quantity, "f")
+    return params
 
 
 def spent_today(settings: Settings, client: CryptoComClient, now: datetime) -> Decimal:
-    """Max of locally logged and exchange-reported USDU_USD buys since local midnight."""
+    """Max of locally logged and exchange-reported USD traded today on this instrument and side."""
+    strategy = settings.strategy
     local_now = now.astimezone()
-    local = live_spend_on(settings.trades_csv, local_now.date())
+    local = live_spend_on(settings.trades_csv, local_now.date(), strategy.instrument, strategy.side)
     if not settings.has_credentials:
         return local
     midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    orders = client.get_order_history(INSTRUMENT_NAME, int(midnight.timestamp() * 1000), int(local_now.timestamp() * 1000))
+    orders = client.get_order_history(
+        strategy.instrument, int(midnight.timestamp() * 1000), int(local_now.timestamp() * 1000)
+    )
     exchange = sum(
-        (_decimal_field(order, "cumulative_value") or Decimal("0") for order in orders if order.get("side") == "BUY"),
+        (
+            _decimal_field(order, "cumulative_value") or Decimal("0")
+            for order in orders
+            if order.get("side") == strategy.side
+        ),
         Decimal("0"),
     )
     return max(local, exchange)
@@ -284,12 +297,13 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def record_from_detail(amount: Decimal, client_oid: str, detail: dict[str, Any]) -> dict[str, Any]:
+def record_from_detail(strategy: Strategy, amount: Decimal, client_oid: str, detail: dict[str, Any]) -> dict[str, Any]:
     return {
         "timestamp_utc": _utc_now(),
         "mode": "LIVE",
-        "instrument": INSTRUMENT_NAME,
-        "side": "BUY",
+        # From the order itself, so a leftover order is logged correctly even if .env changed since.
+        "instrument": detail.get("instrument_name") or strategy.instrument,
+        "side": detail.get("side") or strategy.side,
         "order_type": "MARKET",
         "requested_usd": str(amount),
         "status": detail.get("status", ""),
@@ -305,14 +319,16 @@ def record_from_detail(amount: Decimal, client_oid: str, detail: dict[str, Any])
 
 
 def print_result(record: dict[str, Any]) -> None:
+    bought = record["side"] == "BUY"
     qty = _decimal_field(record, "quantity") or Decimal("0")
     if qty <= 0:
         reason = f" (reason {record['reason']})" if record["reason"] else ""
-        print(f"Order {record['status']}: nothing bought{reason}.")
+        print(f"Order {record['status']}: nothing {'bought' if bought else 'sold'}{reason}.")
         return
-    spent = (_decimal_field(record, "executed_value_usd") or Decimal("0")).quantize(CENT)
+    value = (_decimal_field(record, "executed_value_usd") or Decimal("0")).quantize(CENT)
+    symbol = record["instrument"].split("_")[0]
     fee = f" (fee {record['fee']} {record['fee_currency']})" if record["fee"] else ""
-    print(f"Bought {qty} {BASE_CURRENCY} for ${spent} at ${record['avg_price']}{fee}")
+    print(f"{'Bought' if bought else 'Sold'} {qty} {symbol} for ${value} at ${record['avg_price']}{fee}")
 
 
 def filled_quantity(record: dict[str, Any]) -> Decimal:
@@ -342,7 +358,7 @@ def reconcile_pending(client: CryptoComClient, settings: Settings, journal: Pend
     if detail.get("status") not in TERMINAL_STATUSES:
         print(f"  Still {detail.get('status')} on the exchange. Re-run later.")
         return False
-    record = record_from_detail(Decimal(pending["amount"]), client_oid, detail)
+    record = record_from_detail(settings.strategy, Decimal(pending["amount"]), client_oid, detail)
     append_trade(settings.trades_csv, record)
     journal.clear()
     print_result(record)
@@ -372,50 +388,55 @@ def run(
             print("Refusing to place a new order until the previous one is resolved.")
             return EXIT_FAILED
 
-        rules = load_market_rules(client)
+        strategy = settings.strategy
+        verb = "buy" if strategy.is_buy else "sell"
+        rules = load_market_rules(client, strategy)
 
-        max_amount = max_amount_for_price(rules.best_ask)
-        if max_amount < MIN_AMOUNT_USD:
-            print(f"No trade: price ${rules.best_ask} is too close to ${NO_BUY_PRICE} (max buy ${max_amount:.2f} < ${MIN_AMOUNT_USD}).")
+        max_amount = max_amount_for_price(rules.price, strategy)
+        if max_amount < strategy.min_amount_usd:
+            print(
+                f"No trade: {strategy.symbol} at ${rules.price} is too close to ${strategy.no_trade_price} "
+                f"(max {verb} ${max_amount:.2f} < ${strategy.min_amount_usd})."
+            )
             return EXIT_NOT_PLACED
-        amount = generate_amount(rules.best_ask, rng)
+        amount = generate_amount(rules.price, strategy, rng)
 
         available: Decimal | None = None
         if settings.has_credentials:
-            available = client.get_available_balance(QUOTE_CURRENCY)
+            available = client.get_available_balance(QUOTE_CURRENCY if strategy.is_buy else strategy.symbol)
         spent = spent_today(settings, client, now())
         remaining = settings.daily_limit_usd - spent
 
         try:
-            est_qty = validate_amount(amount, rules, remaining, available)
+            est_qty = validate_amount(amount, rules, strategy, remaining, available)
         except AmountError as exc:
             print(f"No trade: {exc}")
             return EXIT_NOT_PLACED
 
         client_oid = str(uuid.uuid4())
-        params = build_order_params(amount, client_oid)
+        params = build_order_params(strategy, amount, est_qty, client_oid)
 
         if settings.dry_run:
             append_trade(settings.trades_csv, {
-                "timestamp_utc": _utc_now(), "mode": "DRY_RUN", "instrument": INSTRUMENT_NAME,
-                "side": "BUY", "order_type": "MARKET", "requested_usd": str(amount),
-                "status": "DRY_RUN", "client_oid": client_oid, "avg_price": str(rules.best_ask),
+                "timestamp_utc": _utc_now(), "mode": "DRY_RUN", "instrument": strategy.instrument,
+                "side": strategy.side, "order_type": "MARKET", "requested_usd": str(amount),
+                "status": "DRY_RUN", "client_oid": client_oid, "avg_price": str(rules.price),
                 "quantity": str(est_qty), "reason": "preview only; no order submitted",
             })
-            print(f"Dry run: would buy ${amount} (~{est_qty} {BASE_CURRENCY} at ${rules.best_ask}). No order sent.")
+            print(f"Dry run: would {verb} ${amount} (~{est_qty} {strategy.symbol} at ${rules.price}). No order sent.")
             return EXIT_OK
 
         journal.save({"client_oid": client_oid, "amount": str(amount), "created_at": _utc_now()})
         try:
             order_id = submit_order(client, params, sleep=sleep)
         except OrderStateUnknownError as exc:
-            print(f"Order status unknown: {exc}. The next run will check it before buying again.")
+            print(f"Order status unknown: {exc}. The next run will check it before trading again.")
             return EXIT_FAILED
         except ApiError as exc:
             journal.clear()
             append_trade(settings.trades_csv, {
-                "timestamp_utc": _utc_now(), "mode": "LIVE", "instrument": INSTRUMENT_NAME, "side": "BUY",
-                "order_type": "MARKET", "requested_usd": str(amount), "status": "REJECTED",
+                "timestamp_utc": _utc_now(), "mode": "LIVE", "instrument": strategy.instrument,
+                "side": strategy.side, "order_type": "MARKET", "requested_usd": str(amount), "status": "REJECTED",
                 "client_oid": client_oid, "executed_value_usd": "0", "reason": f"{exc.code} {exc.name}",
             })
             print(f"Order rejected: {exc.code} {exc.name}")
@@ -428,7 +449,7 @@ def run(
             print(f"Order {order_id} still {status}; the next run will check it.")
             return EXIT_FAILED
 
-        record = record_from_detail(amount, client_oid, detail)
+        record = record_from_detail(strategy, amount, client_oid, detail)
         append_trade(settings.trades_csv, record)
         journal.clear()
         print_result(record)
